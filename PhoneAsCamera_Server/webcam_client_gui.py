@@ -5,6 +5,8 @@ import struct
 import threading
 import queue
 import traceback
+import os
+import subprocess
 
 import cv2
 import numpy as np
@@ -18,6 +20,65 @@ from PySide6.QtCore import Qt, QThread, Signal, Slot
 from PySide6.QtGui import QPalette, QColor, QImage, QPixmap
 
 TARGET_FPS = 30
+PORT = 8888
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+ADB_FOLDER = os.path.join(script_dir, 'adb_files')
+ADB_PATH = os.path.join(ADB_FOLDER, 'adb.exe')
+
+def run_adb_command(args):
+    """
+    Выполняет команду ADB из папки adb_files.
+    Возвращает кортеж: (success: bool, stdout: str, stderr: str)
+    """
+    if not os.path.exists(ADB_PATH):
+        return False, "", f"Ошибка: Файл adb.exe не найден по пути '{ADB_PATH}'"
+
+    command = [ADB_PATH] + args
+    print(f"[*] Выполнение ADB: {' '.join(command)}")
+
+    try:
+        startupinfo = None
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+
+        process = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            check=False,
+            startupinfo=startupinfo
+        )
+
+        print(f"    Код возврата: {process.returncode}")
+        if process.stdout: 
+            print(f"    Stdout: {process.stdout.strip()}")
+        if process.stderr: 
+            print(f"    Stderr: {process.stderr.strip()}")
+
+        success = process.returncode == 0
+        is_daemon_msg = "daemon started successfully" in process.stderr.lower()
+        if is_daemon_msg and not process.stdout.strip():
+             print("[*] ADB демон только что стартовал, ждем секунду...")
+             time.sleep(1)
+             return run_adb_command(args)
+
+        if args == ['devices']:
+            success = success and process.stdout.strip() != ""
+        elif "error" in process.stderr.lower() and not is_daemon_msg:
+             success = False
+
+
+        return success, process.stdout.strip(), process.stderr.strip()
+
+    except FileNotFoundError:
+        return False, "", f"Ошибка: Команда '{ADB_PATH}' не найдена. Убедитесь, что ADB находится в папке adb_files."
+    except Exception as e:
+        return False, "", f"Неожиданная ошибка при выполнении ADB: {e}"
 
 class WebcamWorker(QThread):
     """
@@ -333,21 +394,70 @@ class WebcamClientGUI(QMainWindow):
         if not self.is_connected:
             connection_mode = 'usb' if self.rb_usb.isChecked() else 'wifi'
             host = '127.0.0.1'
-            port = 8888
 
-            if connection_mode == 'wifi':
+            if connection_mode == 'usb':
+                self.status_label.setText("Статус: Проверка ADB...")
+                QApplication.processEvents()
+
+                adb_ok, _, adb_err = run_adb_command(['version'])
+                if not adb_ok:
+                    self.show_error_message("Ошибка ADB", f"Не удалось выполнить команду ADB.\nУбедитесь, что файлы ADB находятся в папке 'adb_files'.\nОшибка: {adb_err}")
+                    self.reset_ui_to_disconnected()
+                    return
+
+                self.status_label.setText("Статус: Поиск устройства...")
+                QApplication.processEvents()
+                devices_ok, devices_out, devices_err = run_adb_command(['devices'])
+                lines = devices_out.strip().splitlines()
+                connected_devices = []
+                if len(lines) > 1:
+                    for line in lines[1:]:
+                        parts = line.split()
+                        if len(parts) == 2 and parts[1] == 'device':
+                            connected_devices.append(parts[0])
+                        elif len(parts) == 2 and parts[1] == 'unauthorized':
+                            self.show_error_message("Ошибка ADB", "Устройство не авторизовано.\nПожалуйста, разрешите отладку по USB на экране вашего телефона.")
+                            self.reset_ui_to_disconnected()
+                            return
+
+                if not connected_devices:
+                    self.show_error_message("Ошибка ADB", "Подключенное авторизованное Android-устройство не найдено.\nУбедитесь, что телефон подключен по USB и отладка разрешена.")
+                    self.reset_ui_to_disconnected()
+                    return
+                elif len(connected_devices) > 1:
+                    self.show_error_message("Ошибка ADB", f"Обнаружено несколько устройств:\n{', '.join(connected_devices)}\nПожалуйста, оставьте подключенным только одно устройство.")
+                    self.reset_ui_to_disconnected()
+                    return
+                self.status_label.setText(f"Статус: Устройство найдено ({connected_devices[0]}). Настройка порта...")
+                QApplication.processEvents()
+
+                forward_ok, _, forward_err = run_adb_command(['forward', f'tcp:{PORT}', f'tcp:{PORT}'])
+                if not forward_ok:
+                    if "cannot bind listener" in forward_err or "already in use" in forward_err:
+                         print("[*] Порт занят, пытаемся удалить старый форвардинг...")
+                         run_adb_command(['forward', '--remove', f'tcp:{PORT}'])
+                         forward_ok, _, forward_err = run_adb_command(['forward', f'tcp:{PORT}', f'tcp:{PORT}'])
+
+                    if not forward_ok:
+                         self.show_error_message("Ошибка ADB Forward", f"Не удалось настроить проброс порта {PORT}.\nОшибка: {forward_err}")
+                         self.reset_ui_to_disconnected()
+                         return
+                print(f"[*] ADB Forward tcp:{PORT} -> tcp:{PORT} настроен.")
+
+            elif connection_mode == 'wifi':
                 host = self.ip_input.text().strip()
                 if not host:
                     self.show_error_message("Ошибка", "Введите IP адрес телефона для режима Wi-Fi.")
+                    self.reset_ui_to_disconnected()
                     return
 
             self.set_ui_connecting_state(True)
-            self.status_label.setText("Статус: Подключение...")
+            self.status_label.setText("Статус: Подключение к телефону...")
             self.preview_label.clear()
             self.preview_label.setText("Подключение...")
             self.preview_label.setStyleSheet("background-color: black; color: grey;")
 
-            self.worker_thread = WebcamWorker(host, port, TARGET_FPS)
+            self.worker_thread = WebcamWorker(host, PORT, TARGET_FPS)
             self.worker_thread.status_update.connect(self.update_status_label)
             self.worker_thread.connection_successful.connect(self.on_connection_successful)
             self.worker_thread.connection_failed.connect(self.on_connection_failed)
@@ -362,6 +472,9 @@ class WebcamClientGUI(QMainWindow):
             else:
                 print("[?] Попытка отключения, но поток не найден или не запущен.")
                 self.reset_ui_to_disconnected()
+            if self.rb_usb.isChecked():
+                 print("[*] Попытка удалить ADB forward...")
+                 run_adb_command(['forward', '--remove', f'tcp:{PORT}'])
 
     @Slot()
     def switch_camera(self):
@@ -477,6 +590,10 @@ class WebcamClientGUI(QMainWindow):
     def closeEvent(self, event):
         """Обработка закрытия окна."""
         print("[*] Окно закрывается...")
+        if self.is_connected and self.rb_usb.isChecked():
+             print("[*] Попытка удалить ADB forward при закрытии...")
+             run_adb_command(['forward', '--remove', f'tcp:{PORT}'])
+
         if self.worker_thread and self.worker_thread.isRunning():
             print("[*] Запрос на остановку рабочего потока...")
             self.worker_thread.stop()
