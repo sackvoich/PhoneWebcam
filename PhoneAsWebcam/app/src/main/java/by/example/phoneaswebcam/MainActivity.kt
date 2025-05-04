@@ -8,6 +8,7 @@ import android.graphics.YuvImage
 import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.util.Log
+import android.util.Size // Добавьте этот импорт вверху файла, если его нет
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
@@ -109,6 +110,7 @@ class MainActivity : AppCompatActivity() {
 
             imageAnalyzer = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setTargetResolution(Size(1280, 720))
                 .build()
                 .also {
                     it.setAnalyzer(cameraExecutor, { imageProxy -> // Исправлено: убрали ImageAnalyzer
